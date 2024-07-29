@@ -23,104 +23,117 @@
 #include "CHADEMO-BATTERY.h"
 #include "CHADEMO-SHUNTS.h"
 
-/* Initial frames received from ISA shunts provide invalid during initialization */
+/* Initial frames received from ISA shunts provide invalid data during initialization */
 static int framecount = 0;
 
-/* original variables/names/types from SimpleISA. These warrant refinement */
-float Amperes;  // Floating point with current in Amperes
-double AH;      //Floating point with accumulated ampere-hours
-double KW;
-double KWH;
+static float Amperes = 0;  // Floating point with current in Amperes
+static double AH = 0.0;    //Floating point with accumulated ampere-hours
+static double KW = 0.0;
+static double KWH = 0.0;
 
-double Voltage;
-double Voltage1;
-double Voltage2;
-double Voltage3;
-double VoltageHI;
-double Voltage1HI;
-double Voltage2HI;
-double Voltage3HI;
-double VoltageLO;
-double Voltage1LO;
-double Voltage2LO;
-double Voltage3LO;
+static double Voltage = 0.0;
+static double Voltage1 = 0.0;
+static double Voltage2 = 0.0;
+static double Voltage3 = 0.0;
 
-double Temperature;
+static double Temperature = 0.0;
 
-bool firstframe;
-double milliamps;
-long watt;
-long As;
-long lastAs;
-long wh;
-long lastWh;
+static double milliamps = 0.0;
+static long As = 0;
+static long lastAs = 0;
+static long watt = 0;
+static long wh = 0;
+static long lastWh = 0;
 
-/* Output command frame used to alter or initialize ISA shunt behavior
- * Please note that all delay/sleep operations are solely in this section of code,
- * not used during normal operation. Such delays are currently commented out.
+/* Default cmd CAN frame ID for ISA IVT-S, though it is configurable.
+ *  If it differs from expectations, a warning will be emitted.
+ *
  */
-CAN_frame_t outframe = {.FIR = {.B =
-                                    {
-                                        .DLC = 8,
-                                        .unknown_2 = 0,
-                                        .RTR = CAN_no_RTR,
-                                        .FF = CAN_frame_std,
-                                    }},
+#define ISA_CMD_CANID 0x411
 
-                        .MsgID = 0x411,
-                        .data = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}};
+/* Frame for triggering ISA IVT-S commands such as mode changes, configuration updates, resets, etc */
+CAN_frame_t ISA_outframe = {.FIR = {.B =
+                                        {
+                                            .DLC = 8,
+                                            .unknown_2 = 0,
+                                            .RTR = CAN_no_RTR,
+                                            .FF = CAN_frame_std,
+                                        }},
 
-uint16_t get_measured_voltage() {
-  return (uint16_t)Voltage;
+                            .MsgID = ISA_CMD_CANID,
+                            .data = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}};
+
+double ISA_get_measured_voltage1() {
+  return Voltage1;
+}
+double ISA_get_measured_voltage2() {
+  return Voltage2;
+}
+double ISA_get_measured_voltage3() {
+  return Voltage3;
 }
 
-uint16_t get_measured_current() {
-  return (uint16_t)Amperes;
+float ISA_get_measured_current() {
+  return Amperes;
 }
 
 //This is our CAN interrupt service routine to catch inbound frames
-inline void ISA_handleFrame(CAN_frame_t* frame) {
+void ISA_handleFrame(CAN_frame_t* frame) {
 
-  if (frame->MsgID < 0x521 || frame->MsgID > 0x528) {
+  if (!frame)
     return;
-  }
 
   framecount++;
 
+  datalayer.battery.status.CAN_battery_still_alive = CAN_STILL_ALIVE;  //We are getting CAN messages
+
   switch (frame->MsgID) {
     case 0x511:
+      if (frame->data.u8[0] == 0xBF) {
+        Serial.print("ISA IVT ready");
+        uint16_t cmdid = frame->data.u8[2] << 8 | frame->data.u8[1];
+        if (cmdid != ISA_CMD_CANID) {
+          Serial.println("Unknown/incompatible IVT configuration or model?");
+        }
+      }
+
       break;
 
     case 0x521:
-      ISA_handle521(frame);
+      ISA_handleAmperage_521(frame);
       break;
 
     case 0x522:
-      ISA_handle522(frame);
+      ISA_handleVoltage1_522(frame);
       break;
 
     case 0x523:
-      ISA_handle523(frame);
+      ISA_handleVoltage2_523(frame);
       break;
 
     case 0x524:
-      ISA_handle524(frame);
+      ISA_handleVoltage3_524(frame);
       break;
 
     case 0x525:
-      ISA_handle525(frame);
+      ISA_handleTemperature_525(frame);
       break;
 
     case 0x526:
-      ISA_handle526(frame);
+      ISA_handleWatts_526(frame);
       break;
 
     case 0x527:
-      ISA_handle527(frame);
+      ISA_handleAmpHours_527(frame);
       break;
 
     case 0x528:
-      ISA_handle528(frame);
+      ISA_handleWattHours_528(frame);
+      break;
+
+    default:
+      Serial.print("Unhandled frame ID=");
+      Serial.println(frame->MsgID, HEX);
       break;
   }
 
@@ -128,92 +141,91 @@ inline void ISA_handleFrame(CAN_frame_t* frame) {
 }
 
 //handle frame for Amperes
-inline void ISA_handle521(CAN_frame_t* frame) {
-  long current = 0;
-  current =
+inline void ISA_handleAmperage_521(CAN_frame_t* frame) {
+
+  if (!frame)
+    return;
+
+  milliamps =
       (long)((frame->data.u8[5] << 24) | (frame->data.u8[4] << 16) | (frame->data.u8[3] << 8) | (frame->data.u8[2]));
 
-  milliamps = current;
-  Amperes = current / 1000.0f;
+  Amperes = milliamps / 1000.0f;
 }
 
 //handle frame for Voltage
-inline void ISA_handle522(CAN_frame_t* frame) {
+inline void ISA_handleVoltage1_522(CAN_frame_t* frame) {
+
+  if (!frame)
+    return;
+
   long volt =
       (long)((frame->data.u8[5] << 24) | (frame->data.u8[4] << 16) | (frame->data.u8[3] << 8) | (frame->data.u8[2]));
 
   Voltage = volt / 1000.0f;
-  Voltage1 = Voltage - (Voltage2 + Voltage3);
+  Serial.print("Voltage1: ");
+  Serial.println(Voltage);
 
-  if (framecount < 150) {
-    VoltageLO = Voltage;
-    Voltage1LO = Voltage1;
-  } else {
-    if (Voltage < VoltageLO)
-      VoltageLO = Voltage;
-    if (Voltage > VoltageHI)
-      VoltageHI = Voltage;
-    if (Voltage1 < Voltage1LO)
-      Voltage1LO = Voltage1;
-    if (Voltage1 > Voltage1HI)
-      Voltage1HI = Voltage1;
-  }
+  Voltage1 = Voltage - (Voltage2 + Voltage3);
 }
 
 //handle frame for Voltage 2
-inline void ISA_handle523(CAN_frame_t* frame) {
+inline void ISA_handleVoltage2_523(CAN_frame_t* frame) {
+
+  if (!frame)
+    return;
+
   long volt =
       (long)((frame->data.u8[5] << 24) | (frame->data.u8[4] << 16) | (frame->data.u8[3] << 8) | (frame->data.u8[2]));
 
   Voltage2 = volt / 1000.0f;
+
+  Serial.print("Voltage2: ");
+  Serial.println(Voltage2);
+
   if (Voltage2 > 3)
     Voltage2 -= Voltage3;
-
-  if (framecount < 150) {
-    Voltage2LO = Voltage2;
-  } else {
-    if (Voltage2 < Voltage2LO)
-      Voltage2LO = Voltage2;
-    if (Voltage2 > Voltage2HI)
-      Voltage2HI = Voltage2;
-  }
 }
 
 //handle frame for Voltage3
-inline void ISA_handle524(CAN_frame_t* frame) {
+inline void ISA_handleVoltage3_524(CAN_frame_t* frame) {
+
+  if (!frame)
+    return;
+
   long volt =
       (long)((frame->data.u8[5] << 24) | (frame->data.u8[4] << 16) | (frame->data.u8[3] << 8) | (frame->data.u8[2]));
 
   Voltage3 = volt / 1000.0f;
-
-  if (framecount < 150) {
-    Voltage3LO = Voltage3;
-  } else {
-    if (Voltage3 < Voltage3LO && Voltage3 > 10)
-      Voltage3LO = Voltage3;
-    if (Voltage3 > Voltage3HI)
-      Voltage3HI = Voltage3;
-  }
 }
 
-//handle frame for Temperature
-inline void ISA_handle525(CAN_frame_t* frame) {
-  long temp = 0;
-  temp = (long)((frame->data.u8[5] << 24) | (frame->data.u8[4] << 16) | (frame->data.u8[3] << 8) | (frame->data.u8[2]));
+//handle frame for Temperature (C) reported in whole degree increment, but granular to 0.1 °C in packet
+inline void ISA_handleTemperature_525(CAN_frame_t* frame) {
+
+  if (!frame)
+    return;
+
+  long temp =
+      (long)((frame->data.u8[5] << 24) | (frame->data.u8[4] << 16) | (frame->data.u8[3] << 8) | (frame->data.u8[2]));
 
   Temperature = temp / 10;
 }
 
 //handle frame for Kilowatts
-inline void ISA_handle526(CAN_frame_t* frame) {
-  watt = 0;
+inline void ISA_handleWatts_526(CAN_frame_t* frame) {
+
+  if (!frame)
+    return;
+
   watt = (long)((frame->data.u8[5] << 24) | (frame->data.u8[4] << 16) | (frame->data.u8[3] << 8) | (frame->data.u8[2]));
   KW = watt / 1000.0f;
 }
 
 //handle frame for Ampere-Hours
-inline void ISA_handle527(CAN_frame_t* frame) {
-  As = 0;
+inline void ISA_handleAmpHours_527(CAN_frame_t* frame) {
+
+  if (!frame)
+    return;
+
   As = (frame->data.u8[5] << 24) | (frame->data.u8[4] << 16) | (frame->data.u8[3] << 8) | (frame->data.u8[2]);
 
   AH += (As - lastAs) / 3600.0f;
@@ -221,134 +233,31 @@ inline void ISA_handle527(CAN_frame_t* frame) {
 }
 
 //handle frame for kiloWatt-hours
-inline void ISA_handle528(CAN_frame_t* frame) {
+inline void ISA_handleWattHours_528(CAN_frame_t* frame) {
+
+  if (!frame)
+    return;
+
   wh = (long)((frame->data.u8[5] << 24) | (frame->data.u8[4] << 16) | (frame->data.u8[3] << 8) | (frame->data.u8[2]));
   KWH += (wh - lastWh) / 1000.0f;
   lastWh = wh;
 }
 
-/*
-void ISA_initialize() {
-    firstframe=false;
-    STOP();
-    delay(700);
-    for(int i=0;i<9;i++) {
-        Serial.println("initialization \n");
+/* current_mode @1 = start, @0 = stop
+ * restart_mode @1 = start, @0 = stop
+ */
+void ISA_set_mode(bool current_mode, bool restart_mode) {
+  ISA_outframe.data.u8[0] = 0x34; /* mode set subcommand */
+  ISA_outframe.data.u8[1] = current_mode;
 
-        outframe.data.u8[0]=(0x20+i);
-        outframe.data.u8[1]=0x42;
-        outframe.data.u8[2]=0x02;
-        outframe.data.u8[3]=(0x60+(i*18));
-        outframe.data.u8[4]=0x00;
-        outframe.data.u8[5]=0x00;
-        outframe.data.u8[6]=0x00;
-        outframe.data.u8[7]=0x00;
+  ISA_outframe.data.u8[2] = restart_mode;
 
-        ESP32Can.CANWriteFrame(&outframe);
-
-        delay(500);
-
-        sendSTORE();
-        delay(500);
-     }
-
-    START();
-    delay(500);
-    lastAs=As;
-    lastWh=wh;
-
+  ISA_outframe.data.u8[3] = 0x00;
+  ISA_outframe.data.u8[4] = 0x00;
+  ISA_outframe.data.u8[5] = 0x00;
+  ISA_outframe.data.u8[6] = 0x00;
+  ISA_outframe.data.u8[7] = 0x00;
+  ESP32Can.CANWriteFrame(&ISA_outframe);
 }
-
-void ISA_STOP() {
-    outframe.data.u8[0]=0x34;
-    outframe.data.u8[1]=0x00;
-    outframe.data.u8[2]=0x01;
-    outframe.data.u8[3]=0x00;
-    outframe.data.u8[4]=0x00;
-    outframe.data.u8[5]=0x00;
-    outframe.data.u8[6]=0x00;
-    outframe.data.u8[7]=0x00;
-    ESP32Can.CANWriteFrame(&outframe);
-
-}
-
-void ISA_sendSTORE() {
-    outframe.data.u8[0]=0x32;
-    outframe.data.u8[1]=0x00;
-    outframe.data.u8[2]=0x00;
-    outframe.data.u8[3]=0x00;
-    outframe.data.u8[4]=0x00;
-    outframe.data.u8[5]=0x00;
-    outframe.data.u8[6]=0x00;
-    outframe.data.u8[7]=0x00;
-    ESP32Can.CANWriteFrame(&outframe);
-}
-
-void ISA_START() {
-    outframe.data.u8[0]=0x34;
-    outframe.data.u8[1]=0x01;
-    outframe.data.u8[2]=0x01;
-    outframe.data.u8[3]=0x00;
-    outframe.data.u8[4]=0x00;
-    outframe.data.u8[5]=0x00;
-    outframe.data.u8[6]=0x00;
-    outframe.data.u8[7]=0x00;
-    ESP32Can.CANWriteFrame(&outframe);
-}
-
-void ISA_RESTART() {
-    //Has the effect of zeroing AH and KWH  
-    outframe.data.u8[0]=0x3F;
-    outframe.data.u8[1]=0x00;
-    outframe.data.u8[2]=0x00;
-    outframe.data.u8[3]=0x00;
-    outframe.data.u8[4]=0x00;
-    outframe.data.u8[5]=0x00;
-    outframe.data.u8[6]=0x00;
-    outframe.data.u8[7]=0x00;
-    ESP32Can.CANWriteFrame(&outframe);
-}
-
-void ISA_deFAULT() {
-    //Returns module to original defaults  
-    outframe.data.u8[0]=0x3D;
-    outframe.data.u8[1]=0x00;
-    outframe.data.u8[2]=0x00;
-    outframe.data.u8[3]=0x00;
-    outframe.data.u8[4]=0x00;
-    outframe.data.u8[5]=0x00;
-    outframe.data.u8[6]=0x00;
-    outframe.data.u8[7]=0x00;
-    ESP32Can.CANWriteFrame(&outframe);
-}
-
-void ISA_initCurrent() {
-    STOP();
-    delay(500);
-    
-    Serial.println("initialization \n");
-    
-    outframe.data.u8[0]=0x21;
-    outframe.data.u8[1]=0x42;
-    outframe.data.u8[2]=0x01;
-    outframe.data.u8[3]=0x61;
-    outframe.data.u8[4]=0x00;
-    outframe.data.u8[5]=0x00;
-    outframe.data.u8[6]=0x00;
-    outframe.data.u8[7]=0x00;
-
-    ESP32Can.CANWriteFrame(&outframe);
-
-    delay(500);
-
-    sendSTORE();
-    delay(500);
-
-    START();
-    delay(500);
-    lastAs=As;
-    lastWh=wh;
-}
-*/
 
 #endif
