@@ -1,3 +1,4 @@
+#include <WiFi.h>
 #include "../include.h"
 #ifdef CHADEMO_BATTERY
 #include "../datalayer/datalayer.h"
@@ -8,12 +9,14 @@
 #include "CHADEMO-BATTERY.h"
 #include "CHADEMO-SHUNTS.h"
 
-/* CHADEMO handling runs at 6.25 times the rate of most other code, so, rather than the
- *  default value of 12 (for 12 iterations of the 5s value update loop) * 5 for a 60s timeout,
- *  instead use 75 for 75*0.8s = 60s
+/*
+ * Interpretation of Shunt voltage measurements
+ *   Voltage1 = EV side
+ *   Voltage2 = insulation test, between, ground
+ *   Voltage3 = EVSE side
+ *   (i.e.,   v3 measurement (pos) <=> charger_relays <=> v1 measurement <=> PORT <=> ev_relays)
  */
-#undef CAN_STILL_ALIVE
-#define CAN_STILL_ALIVE 75
+
 //#define CH_CAN_DEBUG
 
 static unsigned long setupMillis = 0;
@@ -38,6 +41,7 @@ bool contactors_ready = false;
 uint8_t framecount = 0;
 
 uint8_t max_discharge_current = 0;  //TODO not sure on this one, but really influenced by inverter capability
+uint8_t chargingrate = 0;
 
 bool high_current_control_enabled = false;  // set to true when high current control is operating
                                             //  if true, values from 110.1 and 110.2 should be used instead of 102.3
@@ -51,9 +55,9 @@ CHADEMO_STATE CHADEMO_Status = CHADEMO_IDLE;
  * If sequence number is not agreed upon via H201/H209 between EVSE and Vehicle,
  * V2H 1.1 is assumed
  * Use CHADEMO_seq to decide whether emitting 209 is necessary
- *	0x0	1.0 and earlier
- *	0x1	2.0 appendix A
- *	0x2	2.0 appendix B
+ * 0x0 1.0 and earlier
+ * 0x1 2.0 appendix A
+ * 0x2 2.0 appendix B
  * Unused for now.
 uint8_t CHADEMO_seq = 0x0;
  */
@@ -122,33 +126,37 @@ CAN_frame_t CHADEMO_209 = {.FIR = {.B =
 //This function maps all the values fetched via CAN to the correct parameters used for the inverter
 void update_values_battery() {
 
-  datalayer.battery.status.real_soc = x102_chg_session.StateOfCharge;
-
-  datalayer.battery.status.max_discharge_power_W =
-      (x200_discharge_limits.MaximumDischargeCurrent * x100_chg_lim.MaximumBatteryVoltage);  //In Watts, Convert A to P
-
-  datalayer.battery.status.voltage_dV = get_measured_voltage() * 10;
-
-  datalayer.battery.info.total_capacity_Wh =
-      ((x101_chg_est.RatedBatteryCapacity / 0.11) *
-       1000);  //(Added in CHAdeMO v1.0.1), maybe handle hardcoded on lower protocol version?
-
-  /* TODO max charging rate = 
-   * 	x200_discharge_limits.MaxRemainingCapacityForCharging /
-   * 	    x101_chg_est.RatedBatteryCapacity * 100;
-   */
-
-  datalayer.battery.status.remaining_capacity_Wh = static_cast<uint32_t>(
-      (static_cast<double>(datalayer.battery.status.real_soc) / 10000) * datalayer.battery.info.total_capacity_Wh);
-
   /* To simulate or NOT to simulate battery cell voltages, that is .. A question.
    * Answer for now: Not, because they are not available in any direct manner.
    * This will impact Solax inverter support, which uses cell min/max mV to populate
    * CAN frames.
    */
 
+  /* only update if data received from vehicle */
   if (vehicle_can_received) {
-    uint8_t chargingrate = 0;
+    datalayer.battery.status.real_soc = x102_chg_session.StateOfCharge;
+
+    datalayer.battery.status.max_discharge_power_W = (x200_discharge_limits.MaximumDischargeCurrent *
+                                                      x100_chg_lim.MaximumBatteryVoltage);  //In Watts, Convert A to P
+
+    /* deliberate do NOT updating datalayer.battery.status.voltage_dV
+	   * until the data received from vehicle. Take default val
+	   */
+#warning voltage output may need to be in the middle of the range for the battery until initialized fully
+    datalayer.battery.status.voltage_dV = ISA_get_measured_voltage1() * 10;
+
+    datalayer.battery.info.total_capacity_Wh =
+        ((x101_chg_est.RatedBatteryCapacity / 0.11) *
+         1000);  //(Added in CHAdeMO v1.0.1), maybe handle hardcoded on lower protocol version?
+
+    /* TODO max charging rate =
+	   * 	x200_discharge_limits.MaxRemainingCapacityForCharging /
+	   * 	    x101_chg_est.RatedBatteryCapacity * 100;
+	   */
+
+    datalayer.battery.status.remaining_capacity_Wh = static_cast<uint32_t>(
+        (static_cast<double>(datalayer.battery.status.real_soc) / 10000) * datalayer.battery.info.total_capacity_Wh);
+
     if (x100_chg_lim.ConstantOfChargingRateIndication > 0) {
       chargingrate = x102_chg_session.StateOfCharge / x100_chg_lim.ConstantOfChargingRateIndication * 100;
     }
@@ -209,7 +217,6 @@ inline void process_vehicle_charging_session(CAN_frame_t rx_frame) {
 
 #ifdef DEBUG_VIA_USB
   //Note on p131
-  uint8_t chargingrate = 0;
   if (x100_chg_lim.ConstantOfChargingRateIndication > 0) {
     chargingrate = x102_chg_session.StateOfCharge / x100_chg_lim.ConstantOfChargingRateIndication * 100;
     Serial.print("Charge Rate (kW):");
@@ -267,7 +274,8 @@ inline void process_vehicle_charging_session(CAN_frame_t rx_frame) {
   }
 
   // end
-  if (priorTargetBatteryVoltage > 0 && newTargetBatteryVoltage == 0) {
+  if ((priorTargetBatteryVoltage > 0 && newTargetBatteryVoltage == 0) ||
+      (priorChargingCurrentRequest > 0 && newChargingCurrentRequest == 0)) {
     CHADEMO_Status = CHADEMO_STOP;
     return;
   }
@@ -333,7 +341,8 @@ inline void process_vehicle_charging_limits(CAN_frame_t rx_frame) {
   */
 #endif
 
-  if (get_measured_voltage() <= x200_discharge_limits.MinimumDischargeVoltage && CHADEMO_Status > CHADEMO_NEGOTIATE) {
+  if (ISA_get_measured_voltage1() <= x200_discharge_limits.MinimumDischargeVoltage &&
+      CHADEMO_Status > CHADEMO_NEGOTIATE) {
 #ifdef DEBUG_VIA_USB
     Serial.println("x200 minimum discharge voltage met or exceeded, stopping.");
 #endif
@@ -395,7 +404,7 @@ void receive_can_battery(CAN_frame_t rx_frame) {
   // CHADEMO coexists with a CAN-based shunt. Only process CHADEMO-specific IDs
   // 202 is unknown
   if (!((rx_frame.MsgID >= 0x100 && rx_frame.MsgID <= 0x202) || rx_frame.MsgID == 0x700)) {
-    return;
+    return ISA_handleFrame(&rx_frame);
   }
 
   // used for testing vehicle sanity
@@ -535,8 +544,8 @@ void update_evse_status(CAN_frame_t& f) {
     x109_evse_state.remaining_time_1m = 60;
 
   } else if (EVSE_mode == CHADEMO_CHARGE) {
-    x109_evse_state.setpoint_HV_VDC = get_measured_voltage();
-    x109_evse_state.setpoint_HV_IDC = get_measured_current();
+    x109_evse_state.setpoint_HV_VDC = ISA_get_measured_voltage1();
+    x109_evse_state.setpoint_HV_IDC = ISA_get_measured_current();
 
     /*For posterity if anyone is forced to simulate a shunt
       NOTE: these are supposed to be measured values, e.g., from a shunt
@@ -618,7 +627,7 @@ void update_evse_discharge_estimate(CAN_frame_t& f) {
 /* x208 EVSE, peer to 0x200 Vehicle */
 void update_evse_discharge_capabilities(CAN_frame_t& f) {
   //present discharge current is a measured value
-  x208_evse_dischg_cap.present_discharge_current = 0xFF - get_measured_current();
+  x208_evse_dischg_cap.present_discharge_current = 0xFF - ISA_get_measured_current();
 
   /* Present discharge current is a measured value. In the absence of
      a shunt, the evse here is quite literally lying to the vehicle. The spec
@@ -881,9 +890,19 @@ void handle_chademo_sequence() {
                     } else {
                         evse_present_voltage = vehicle voltage_target;
                     }
+
+		Voltage3 Voltage2 Voltage1
+
+	WARNING: spec indicates EV contactors should be OPEN before applying test voltage. this state (indicated by vehicle permission indicated on pin4) occurs JUST before EV contactor opening
+		Measure EV side with contactors closed (Voltage1)
+		Enable charger output (voltage3)
+		Measure leakage (voltage2)
+		While charging, Voltage3 should == Voltage2 should == voltage1 (realistically voltage3>=voltage2>=voltage1 due to losses where delta between each should be <2v absolute max
+		While DIScharging, the opposite should be the case. i.e., dropping in the direction of the load, whichever it happens to be.
+
        */
       if (x102_chg_session.s.status.StatusVehicleChargingEnabled) {
-        if (get_measured_voltage() < 20) {
+        if (ISA_get_measured_voltage2() < 20) {
 
           digitalWrite(CHADEMO_PIN_10, HIGH);
           evse_permission = true;
@@ -931,7 +950,7 @@ void handle_chademo_sequence() {
 #ifdef DEBUG_VIA_USB
         Serial.println("Contactors ready");
         Serial.print("Voltage: ");
-        Serial.println(get_measured_voltage());
+        Serial.println(ISA_get_measured_voltage3());
 #endif
         /* transition to POWERFLOW state if discharge compatible on both sides */
         if (x109_evse_state.discharge_compatible && x102_chg_session.s.status.StatusVehicleDischargeCompatible &&
@@ -970,7 +989,7 @@ void handle_chademo_sequence() {
         //	probably unnecessary as other flags will be set causing this to be caught
       }
 
-      if (get_measured_voltage() <= x200_discharge_limits.MinimumDischargeVoltage) {
+      if (ISA_get_measured_voltage1() <= x200_discharge_limits.MinimumDischargeVoltage) {
 #ifdef DEBUG_VIA_USB
         Serial.println("x200 minimum discharge voltage met or exceeded, stopping.");
 #endif
@@ -1000,8 +1019,9 @@ void handle_chademo_sequence() {
        *
        * We will re-enter the handler until the amperage drops sufficiently
        * and then transition to CHADEMO_IDLE
+       * TODO CONTACTOR tweak here?
        */
-      if (get_measured_current() <= 5 && get_measured_voltage() <= 10) {
+      if (ISA_get_measured_current() <= 5 && ISA_get_measured_voltage1() <= 10) {
         /* welding detection ideally here */
         digitalWrite(CHADEMO_PIN_10, LOW);
         digitalWrite(CHADEMO_PIN_2, LOW);
